@@ -44,6 +44,8 @@ spec:
                   properties:
                     eSwitchMode:
                       type: string
+                    isRdma:
+                      type: boolean
                     linkType:
                       type: string
                     mtu:

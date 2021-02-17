@@ -2,19 +2,28 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/Mellanox/rdmamap"
 	"github.com/golang/glog"
+	"github.com/vishvananda/netlink"
+	"k8s.io/apimachinery/pkg/util/wait"
+
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 )
 
 type MellanoxPlugin struct {
 	PluginName  string
 	SpecVersion string
+	nicSyncList *nicSpecMap
 }
 
 type mlnxNic struct {
@@ -22,6 +31,11 @@ type mlnxNic struct {
 	totalVfs    int
 	linkTypeP1  string
 	linkTypeP2  string
+}
+
+type nicSpecMap struct {
+	sync.RWMutex
+	items sriovnetworkv1.Interfaces
 }
 
 const (
@@ -46,8 +60,20 @@ func init() {
 	Plugin = MellanoxPlugin{
 		PluginName:  "mellanox_plugin",
 		SpecVersion: "1.0",
+		nicSyncList: &nicSpecMap{},
 	}
 	mellanoxNicsStatus = map[string]map[string]sriovnetworkv1.InterfaceExt{}
+	// Launch periodic check for VF admin mac and node guid workers
+	go wait.UntilWithContext(context.Background(), func(ctx context.Context) {
+		for {
+			select {
+			case <-time.After(30 * time.Second):
+				Plugin.nicSpecPeriodicCheck()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}, 30*time.Second)
 }
 
 // Name returns the name of the plugin
@@ -92,6 +118,9 @@ func (p *MellanoxPlugin) OnNodeStateChange(old, new *sriovnetworkv1.SriovNetwork
 			}
 		}
 	}
+
+	// Mellanox periodic check for VF node_guid
+	p.updateNicSpec(new)
 
 	// Add only mellanox cards that required changes in the map, to help track dual port NICs
 	for _, iface := range new.Spec.Interfaces {
@@ -169,6 +198,97 @@ func (p *MellanoxPlugin) OnNodeStateChange(old, new *sriovnetworkv1.SriovNetwork
 	}
 	glog.V(2).Infof("mellanox-plugin needDrain %v needReboot %v", needDrain, needReboot)
 	return
+}
+
+func (p *MellanoxPlugin) updateNicSpec(state *sriovnetworkv1.SriovNetworkNodeState) {
+	p.nicSyncList.Lock()
+	defer p.nicSyncList.Unlock()
+
+	var interfaces sriovnetworkv1.Interfaces
+OUTER:
+	for _, ifaceStatus := range state.Status.Interfaces {
+		if ifaceStatus.Vendor != MellanoxVendorId {
+			continue
+		}
+		for _, ifaceSpec := range state.Spec.Interfaces {
+			if ifaceSpec.PciAddress != ifaceStatus.PciAddress {
+				continue
+			}
+			// Skip non RDMA NICs
+			if !ifaceSpec.IsRdma {
+				continue OUTER
+			}
+			if ifaceSpec.NumVfs == 0 {
+				continue OUTER
+			}
+
+			interfaces = append(interfaces, ifaceSpec)
+		}
+	}
+
+	p.nicSyncList.items = interfaces
+}
+
+func (p *MellanoxPlugin) nicSpecPeriodicCheck() {
+	glog.Info("mellanox-plugin nicSpecPeriodicCheck()")
+	glog.Info("################ Start ################")
+	p.nicSyncList.RLock()
+	defer p.nicSyncList.RUnlock()
+
+	var interfaces sriovnetworkv1.Interfaces
+
+OUTER:
+	for _, iface := range p.nicSyncList.items {
+		pfLink, err := netlink.LinkByName(iface.Name)
+		if err != nil {
+			glog.Warningf("mellanox-plugin nicSpecPeriodicCheck(): failed to get PF %s Link object: %v", iface.PciAddress, err)
+			continue
+		}
+
+		for _, vf := range pfLink.Attrs().Vfs {
+			vfNetDev, err := utils.GetVFNameFromIndex(iface.PciAddress, vf.ID)
+			if err != nil {
+				glog.Warningf("mellanox-plugin nicSpecPeriodicCheck(): failed to VF NetDevName, PF pciAddress %s, VFID %d : %v", iface.PciAddress, vf.ID, err)
+				continue
+			}
+			vfRdmaDev, err := rdmamap.GetRdmaDeviceForNetdevice(vfNetDev)
+			if err != nil {
+				glog.Warningf("mellanox-plugin nicSpecPeriodicCheck(): failed to VF %s RDMA device: %v", vfNetDev, err)
+				continue
+			}
+			vfRdmaLink, err := netlink.RdmaLinkByName(vfRdmaDev)
+			if err != nil {
+				glog.Warningf("mellanox-plugin nicSpecPeriodicCheck(): failed to RDMA device %s link: %v", vfRdmaDev, err)
+				continue
+			}
+
+			trimedNodeGuid := strings.ReplaceAll(vfRdmaLink.Attrs.NodeGuid, ":", "")
+			trimedNodeGUIDMac := trimedNodeGuid[:6] + trimedNodeGuid[10:]
+
+			trimedAdminMac := strings.ReplaceAll(vf.Mac.String(), ":", "")
+
+			if trimedNodeGUIDMac != trimedAdminMac || trimedNodeGUIDMac == "000000000000" {
+				glog.Infof("mellanox-plugin nicSpecPeriodicCheck() vf info %+v", vf)
+				glog.Infof("mellanox-plugin nicSpecPeriodicCheck() trimedNodeGUIDMac %q", trimedNodeGUIDMac)
+				glog.Infof("mellanox-plugin nicSpecPeriodicCheck() trimedAdminMac %q", trimedAdminMac)
+				interfaces = append(interfaces, iface)
+				continue OUTER
+			}
+		}
+	}
+
+	if len(interfaces) == 0 {
+		glog.Info("mellanox-plugin nicSpecPeriodicCheck(): no interfaces need update")
+	}
+
+	for _, iface := range interfaces {
+		glog.Infof("mellanox-plugin nicSpecPeriodicCheck(): update node_guid and admin mac for PF %q VFs", iface.PciAddress)
+		if err := utils.SetVfsAdminMac(&iface); err != nil {
+			glog.Warningf("mellanox-plugin nicSpecPeriodicCheck(): failed to set VF admin mac for %q: %v", iface.PciAddress, err)
+		}
+	}
+
+	glog.Info("################ End ################")
 }
 
 // Apply config change

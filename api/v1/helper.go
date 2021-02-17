@@ -310,6 +310,7 @@ func (p *SriovNetworkNodePolicy) Apply(state *SriovNetworkNodeState, merge bool)
 				Name:        iface.Name,
 				LinkType:    p.Spec.LinkType,
 				EswitchMode: p.Spec.EswitchMode,
+				IsRdma:      p.Spec.IsRdma,
 			}
 			var group *VfGroup
 			if p.Spec.NumVfs > 0 {

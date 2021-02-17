@@ -231,7 +231,7 @@ func configSriovDevice(iface *sriovnetworkv1.Interface, ifaceStatus *sriovnetwor
 			if err = setVfsGuid(iface); err != nil {
 				return err
 			}
-		} else if err = setVfsAdminMac(ifaceStatus); err != nil {
+		} else if err = SetVfsAdminMac(iface); err != nil {
 			return err
 		}
 	}
@@ -521,11 +521,11 @@ func vfIsReady(pciAddr string) (netlink.Link, error) {
 	return vfLink, nil
 }
 
-func setVfsAdminMac(iface *sriovnetworkv1.InterfaceExt) error {
-	glog.Infof("setVfsAdminMac(): device %s", iface.PciAddress)
+func SetVfsAdminMac(iface *sriovnetworkv1.Interface) error {
+	glog.Infof("SetVfsAdminMac(): device %s", iface.PciAddress)
 	pfLink, err := netlink.LinkByName(iface.Name)
 	if err != nil {
-		glog.Errorf("setVfsAdminMac(): unable to get PF link for device %+v %q", iface, err)
+		glog.Errorf("SetVfsAdminMac(): unable to get PF link for device %+v %q", iface, err)
 		return err
 	}
 	vfs, err := dputils.GetVFList(iface.PciAddress)
@@ -535,12 +535,12 @@ func setVfsAdminMac(iface *sriovnetworkv1.InterfaceExt) error {
 	for _, addr := range vfs {
 		vfID, err := dputils.GetVFID(addr)
 		if err != nil {
-			glog.Errorf("setVfsAdminMac(): unable to get VF id %+v %q", iface.PciAddress, err)
+			glog.Errorf("SetVfsAdminMac(): unable to get VF id %+v %q", iface.PciAddress, err)
 			return err
 		}
 		vfLink, err := vfIsReady(addr)
 		if err != nil {
-			glog.Errorf("setVfsAdminMac(): VF link is not ready for device %+v %q", addr, err)
+			glog.Errorf("SetVfsAdminMac(): VF link is not ready for device %+v %q", addr, err)
 			return err
 		}
 		if err := netlink.LinkSetVfHardwareAddr(pfLink, vfID, vfLink.Attrs().HardwareAddr); err != nil {
@@ -655,4 +655,18 @@ func GetPhysPortName(name string) (string, error) {
 		return strings.TrimSpace(string(physPortName)), nil
 	}
 	return "", nil
+}
+
+func GetVFNameFromIndex(pfPciAddress string, vfID int) (string, error) {
+	glog.V(2).Infof("GetVFNameFromIndex(): PF %s, vfID %d", pfPciAddress, vfID)
+	vfDir := fmt.Sprintf("/sys/bus/pci/devices/%s/virtfn%d/net", pfPciAddress, vfID)
+	netDevs, err := ioutil.ReadDir(vfDir)
+	if err != nil {
+		return "", err
+	}
+	if len(netDevs) == 0 {
+		return "", nil
+	}
+
+	return netDevs[0].Name(), nil
 }
